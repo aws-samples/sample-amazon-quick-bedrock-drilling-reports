@@ -1,0 +1,943 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Daily Drilling Report (DDR) Intelligence pipeline. Upload a DDR PDF in any
+  operator format to s3://<bucket>/raw/ and the stack extracts a canonical
+  record with Claude on Amazon Bedrock, writes it to curated/ as TSV, exposes
+  it through AWS Glue and Amazon Athena, and refreshes an Amazon Quick
+  dashboard (KPIs, time vs depth, TD attainment, footage by well, footage plus
+  ROP). Prerequisites: an Amazon Quick subscription in this Region, Bedrock
+  model access enabled for the chosen Claude model, and Amazon Quick access to
+  Athena enabled once under Security and permissions. The template grants
+  Amazon Quick access to the data bucket through a bucket policy, so no bucket
+  selection is needed in the Quick console. Note: Amazon QuickSight is now part
+  of Amazon Quick; the quicksight API, ARNs, and AWS::QuickSight CloudFormation
+  types are unchanged.
+
+Parameters:
+  QuickSightUserArn:
+    Type: String
+    Description: >
+      ARN of the Amazon Quick (QuickSight) user who will own the assets. Find it with:
+      aws quicksight list-users --aws-account-id <acct> --namespace default
+      --region <identity-region>
+  BedrockModelId:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-6
+    Description: >
+      Amazon Bedrock inference profile ID for the Claude model that performs
+      extraction. Default is the US cross-region profile for Claude Sonnet 4.6.
+      To swap models, set this to the cross-region inference profile ID for
+      your geography (us., eu., au., or jp. (global. also available) prefix). Find the full list at
+      https://docs.aws.amazon.com/bedrock/latest/userguide/inference-profiles-support.html
+      and enable model access for your choice in the Amazon Bedrock console.
+  DataSetImportMode:
+    Type: String
+    Default: SPICE
+    AllowedValues: [SPICE, DIRECT_QUERY]
+    Description: >
+      SPICE (default) loads data into the Amazon Quick in-memory store and needs
+      SPICE capacity in the deployment Region. DIRECT_QUERY runs dashboard
+      queries live against Athena, needs no SPICE capacity, and skips the
+      refresh schedule because every view reads current data.
+  BucketPrefix:
+    Type: String
+    Default: ddr-intel
+    AllowedPattern: '[a-z0-9-]{3,30}'
+    Description: Lowercase prefix for the data bucket (account id is appended).
+
+Conditions:
+  UseSpice: !Equals [!Ref DataSetImportMode, SPICE]
+
+Resources:
+
+  # ---------------------------------------------------------------- S3 + trigger
+  # One data bucket with three prefixes:
+  #   raw/            DDR PDFs uploaded by the user (triggers the Lambda)
+  #   curated/        one TSV row per report, written by the Lambda, read by Athena
+  #   athena-results/ Athena query output, read by Amazon Quick
+  DataBucket:
+    Type: AWS::S3::Bucket
+    # S3 validates the notification config at create time, so the Lambda
+    # invoke permission must exist first. Depending on LoggingBucketPolicy
+    # ensures the log delivery grant is in place before the first log delivery.
+    DependsOn:
+      - S3InvokePermission
+      - LoggingBucketPolicy
+    Properties:
+      BucketName: !Sub '${BucketPrefix}-${AWS::AccountId}'
+      # SSE-S3 rather than SSE-KMS: encryption at rest with no KMS key policy
+      # or kms:Decrypt grants needed for the Lambda role or the Quick roles.
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      # Server access logs go to a separate bucket (see LoggingBucket below).
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: data-bucket/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Only PDFs under raw/ invoke the extractor. Two rules cover .pdf and
+      # .PDF because S3 suffix filters are case sensitive.
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: raw/
+                  - Name: suffix
+                    Value: .pdf
+            Function: !GetAtt ExtractFunction.Arn
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: raw/
+                  - Name: suffix
+                    Value: .PDF
+            Function: !GetAtt ExtractFunction.Arn
+
+  # Grants Amazon Quick access to the bucket so no bucket selection is needed
+  # in the Quick console. Principal is '*' because the Quick service roles
+  # carry a version suffix (aws-quicksight-service-role-v0, -v1, ...); the
+  # aws:PrincipalAccount and aws:PrincipalArn conditions restrict the
+  # statements to those roles in this account only.
+  DataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: QuickSuiteBucketAccess
+            Effect: Allow
+            Principal: '*'
+            Action:
+              - s3:GetBucketLocation
+              - s3:ListBucket
+              - s3:ListBucketVersions
+              - s3:ListBucketMultipartUploads
+            Resource: !Sub 'arn:aws:s3:::${BucketPrefix}-${AWS::AccountId}'
+            Condition:
+              StringEquals:
+                aws:PrincipalAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:PrincipalArn:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/service-role/aws-quicksight-service-role-v*'
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/service-role/aws-quicksight-s3-consumers-role-v*'
+          - Sid: QuickSuiteObjectAccess
+            Effect: Allow
+            Principal: '*'
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:PutObject
+              - s3:AbortMultipartUpload
+              - s3:ListMultipartUploadParts
+            Resource:
+              - !Sub 'arn:aws:s3:::${BucketPrefix}-${AWS::AccountId}/athena-results/*'
+              - !Sub 'arn:aws:s3:::${BucketPrefix}-${AWS::AccountId}/curated/*'
+              - !Sub 'arn:aws:s3:::${BucketPrefix}-${AWS::AccountId}/raw/*'
+            Condition:
+              StringEquals:
+                aws:PrincipalAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:PrincipalArn:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/service-role/aws-quicksight-service-role-v*'
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/service-role/aws-quicksight-s3-consumers-role-v*'
+          # Reject any request that is not over HTTPS. All AWS SDKs, the CLI,
+          # Athena, and Quick use HTTPS, so this only blocks misconfigured clients.
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub 'arn:aws:s3:::${BucketPrefix}-${AWS::AccountId}'
+              - !Sub 'arn:aws:s3:::${BucketPrefix}-${AWS::AccountId}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # Target for DataBucket server access logs. The log bucket also logs its
+  # own access under self/ so that every bucket in the stack has access
+  # logging enabled. S3 supports a bucket logging to itself; the cost is a
+  # small stream of "logs of log deliveries" under self/. DestinationBucketName
+  # uses the literal name because a resource cannot !Ref itself.
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${BucketPrefix}-${AWS::AccountId}-logs'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Sub '${BucketPrefix}-${AWS::AccountId}-logs'
+        LogFilePrefix: self/
+      # Access logs are kept for 90 days, then expired. Because the bucket is
+      # versioned, expiry leaves a noncurrent version and a delete marker, so a
+      # second rule removes those. Adjust ExpirationInDays to your retention
+      # policy. ExpiredObjectDeleteMarker cannot share a rule with
+      # ExpirationInDays, which is why there are two rules.
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAccessLogs
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: RemoveExpiredDeleteMarkers
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+      # ACLs disabled (the default for new buckets), so log delivery is
+      # authorized through the bucket policy below rather than an ACL grant.
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # Lets the S3 logging service write DataBucket logs under data-bucket/ and
+  # the log bucket's own logs under self/, each scoped to this account and its
+  # source bucket. Source ARNs are built with !Sub rather than !Ref to avoid
+  # circular dependencies.
+  LoggingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LoggingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub 'arn:aws:s3:::${BucketPrefix}-${AWS::AccountId}-logs/data-bucket/*'
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:s3:::${BucketPrefix}-${AWS::AccountId}'
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: S3ServerAccessLogsSelfPolicy
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub 'arn:aws:s3:::${BucketPrefix}-${AWS::AccountId}-logs/self/*'
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:s3:::${BucketPrefix}-${AWS::AccountId}-logs'
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub 'arn:aws:s3:::${BucketPrefix}-${AWS::AccountId}-logs'
+              - !Sub 'arn:aws:s3:::${BucketPrefix}-${AWS::AccountId}-logs/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # Allows S3 to invoke the extractor. SourceArn is a string built with !Sub,
+  # not !Ref DataBucket, because DataBucket depends on this resource.
+  S3InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ExtractFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub 'arn:aws:s3:::${BucketPrefix}-${AWS::AccountId}'
+
+  # ---------------------------------------------------------------- Lambda
+  # Least privilege for the extractor: read raw/, write curated/, invoke the
+  # chosen Bedrock model through a cross-Region inference profile (which needs
+  # both the profile ARN and the underlying foundation-model ARNs), and start
+  # a SPICE ingestion for the dataset.
+  ExtractFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ddr-extract
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${BucketPrefix}-${AWS::AccountId}/raw/*'
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub 'arn:aws:s3:::${BucketPrefix}-${AWS::AccountId}/curated/*'
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - 'arn:aws:bedrock:*::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*'
+              - Effect: Allow
+                Action: quicksight:CreateIngestion
+                Resource: !Sub 'arn:aws:quicksight:${AWS::Region}:${AWS::AccountId}:dataset/ddr-reports-dataset/ingestion/*'
+
+  # Extracts one canonical record from each uploaded PDF. Inline code is kept
+  # under CloudFormation's 4,096 character ZipFile limit so the sample deploys
+  # as a single file; move it to a packaged artifact if it grows.
+  ExtractFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-ddr-extract'
+      Runtime: python3.12
+      Handler: index.handler
+      # A multi-page PDF extraction plus throttling retries can take a few minutes.
+      Timeout: 180
+      MemorySize: 512
+      # Limits concurrent invocations, which bounds parallel Bedrock calls
+      # when many PDFs are uploaded at once.
+      ReservedConcurrentExecutions: 3
+      Role: !GetAtt ExtractFunctionRole.Arn
+      Environment:
+        Variables:
+          MODEL_ID: !Ref BedrockModelId
+          ACCT: !Ref AWS::AccountId
+          DSID: ddr-reports-dataset
+          IMPORT_MODE: !Ref DataSetImportMode
+      Code:
+        ZipFile: |
+          import json,os,re,time,urllib.parse,boto3
+          s3=boto3.client('s3');br=boto3.client('bedrock-runtime');qs=boto3.client('quicksight')
+          # Column order defines the curated TSV and must match GlueTable and QSDataSet
+          C=["well_id","operator","rig_name","report_no","report_date","spud_date","status","measured_depth_ft","tvd_ft","proposed_td_ft","daily_footage_ft","drilling_hours","avg_rop_ft_hr","days_actual","days_planned","flat_days_actual","npt_hours","mud_density_ppg","last_casing_size_in","last_casing_depth_ft","incidents","daily_cost_usd","afe_usd","summary_24h","planned_24h","events"]
+          N=set(C[7:23])  # numeric columns, coerced to plain numbers in handler
+          # Extraction prompt. The PDF itself is passed to Claude as a Converse document block.
+          P=("You extract structured data from a daily drilling report PDF. Reports come from many operators with different layouts, in metric or imperial units. "
+          "Return ONLY a JSON object, no prose, with exactly these keys: "+", ".join(C)+". Rules: "
+          "convert all depths and footage to feet (multiply meters by 3.28084); dates as YYYY-MM-DD; "
+          "report_date is the single day the report covers; when the report shows a period or date range, use the end date of that period; "
+          "treat -999.99, '---' or blank as null; daily_footage_ft is distance drilled in the report period; "
+          "npt_hours equals the sum of numeric values printed in the report's dedicated non-productive time column; if that column is blank on every row, npt_hours is 0; never infer non-productive time from event descriptions such as failed tests, waiting, or repairs; "
+          "incidents is the count of safety incidents (0 if report states none); "
+          "events is an array of up to 5 short strings formatted 'TYPE: text' with TYPE one of MILESTONE, WATCH, NPT; "
+          "summary_24h and planned_24h are one sentence each; all numbers plain with no units or thousands separators.")
+          def sv(v):  # one TSV cell: flatten lists, strip tabs and newlines
+           if v is None:return ""
+           if isinstance(v,list):v="; ".join(str(x) for x in v)
+           return re.sub(r'[\t\n\r]',' ',str(v)).strip()
+          def bx(pdf):  # call Bedrock, retrying up to 3 times on throttling
+           for a in range(4):
+            try:
+             return br.converse(modelId=os.environ['MODEL_ID'],messages=[{"role":"user","content":[{"document":{"name":"ddr","format":"pdf","source":{"bytes":pdf},"citations":{"enabled":True}}},{"text":P}]}],inferenceConfig={"maxTokens":1500,"temperature":0})
+            except Exception as x:
+             if a<3 and ('Throttl' in str(x) or 'TooMany' in str(x)):time.sleep(8*(a+1));continue
+             raise
+          def handler(event,ctx):
+           for r in event.get('Records',[]):  # one record per PDF uploaded under raw/
+            b=r['s3']['bucket']['name'];k=urllib.parse.unquote_plus(r['s3']['object']['key'])
+            if not k.lower().endswith('.pdf'):continue
+            pdf=s3.get_object(Bucket=b,Key=k)['Body'].read()
+            o=bx(pdf)
+            t=''.join(c.get('text','') for c in o['output']['message']['content'])
+            j=json.loads(re.search(r'\{.*\}',t,re.S).group(0))
+            base=re.sub(r'[^A-Za-z0-9_-]','_',k.split('/')[-1].rsplit('.',1)[0])
+            if not j.get("well_id"):j["well_id"]=base  # fall back to the PDF filename
+            for f in N:
+             v=j.get(f)
+             if isinstance(v,str):
+              m=re.search(r'-?\d+\.?\d*',v.replace(',',''))
+              j[f]=m.group(0) if m else ""
+            # Write one TSV row to curated/; Athena reads this prefix
+            row="\t".join(sv(j.get(f)) for f in C)+"\n"
+            s3.put_object(Bucket=b,Key="curated/"+base+".tsv",Body=row.encode())
+            print("curated row written for",k)
+            # SPICE mode only: start an ingestion now instead of waiting for the hourly schedule
+            if os.environ.get('IMPORT_MODE','SPICE')=='SPICE':
+             for a in range(2):
+              try:
+               qs.create_ingestion(AwsAccountId=os.environ['ACCT'],DataSetId=os.environ['DSID'],IngestionId="ing"+str(time.time_ns()));break
+              except Exception as x:
+               print("ingestion attempt",a+1,":",x)
+               if a==0 and ('Limit' in str(x) or 'Conflict' in str(x)):time.sleep(30)
+           return {"ok":True}
+
+  # ---------------------------------------------------------------- Glue + Athena
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: ddr_reports_db
+        Description: Canonical daily drilling report records
+
+  # External table over the tab-separated files the Lambda writes to curated/.
+  # Column order must match the C list in ExtractFunction and the InputColumns
+  # in QSDataSet. No crawler is needed because the schema is fixed.
+  GlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: ddr_reports
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: csv
+          delimiter: "\t"
+        StorageDescriptor:
+          Location: !Sub 's3://${BucketPrefix}-${AWS::AccountId}/curated/'
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe
+            Parameters:
+              field.delim: "\t"
+          Columns:
+            - { Name: well_id, Type: string }
+            - { Name: operator, Type: string }
+            - { Name: rig_name, Type: string }
+            - { Name: report_no, Type: string }
+            - { Name: report_date, Type: date }
+            - { Name: spud_date, Type: date }
+            - { Name: status, Type: string }
+            - { Name: measured_depth_ft, Type: double }
+            - { Name: tvd_ft, Type: double }
+            - { Name: proposed_td_ft, Type: double }
+            - { Name: daily_footage_ft, Type: double }
+            - { Name: drilling_hours, Type: double }
+            - { Name: avg_rop_ft_hr, Type: double }
+            - { Name: days_actual, Type: double }
+            - { Name: days_planned, Type: double }
+            - { Name: flat_days_actual, Type: double }
+            - { Name: npt_hours, Type: double }
+            - { Name: mud_density_ppg, Type: double }
+            - { Name: last_casing_size_in, Type: double }
+            - { Name: last_casing_depth_ft, Type: double }
+            - { Name: incidents, Type: double }
+            - { Name: daily_cost_usd, Type: double }
+            - { Name: afe_usd, Type: double }
+            - { Name: summary_24h, Type: string }
+            - { Name: planned_24h, Type: string }
+            - { Name: events, Type: string }
+
+  # Dedicated workgroup so Quick queries always write results to
+  # athena-results/, the prefix the bucket policy grants Quick access to.
+  # EnforceWorkGroupConfiguration prevents a client from overriding that location.
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-ddr-wg'
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${BucketPrefix}-${AWS::AccountId}/athena-results/'
+
+  # ---------------------------------------------------------------- QuickSight
+  # Amazon Quick assets. The AWS::QuickSight resource types and the
+  # quicksight: IAM actions are unchanged under the Amazon Quick name.
+  # Every asset grants the QuickSightUserArn parameter full ownership.
+
+  # Dark executive theme applied to the dashboard. Colors are cosmetic and
+  # safe to change; the palette order maps to series order in the visuals.
+  QSTheme:
+    Type: AWS::QuickSight::Theme
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      ThemeId: ddr-exec-dark
+      Name: DDR Executive Dark
+      BaseThemeId: MIDNIGHT
+      Configuration:
+        DataColorPalette:
+          Colors:
+            - '#4FA3C4'
+            - '#E8A13D'
+            - '#3FA372'
+            - '#8E7CC3'
+            - '#E06C5A'
+            - '#5BC0BE'
+            - '#C9A227'
+            - '#7F93A8'
+            - '#D48FB8'
+            - '#9CC97F'
+          MinMaxGradient:
+            - '#152234'
+            - '#4FA3C4'
+          EmptyFillColor: '#22334A'
+        UIColorPalette:
+          PrimaryBackground: '#0E1724'
+          PrimaryForeground: '#E8EDF2'
+          SecondaryBackground: '#152234'
+          SecondaryForeground: '#9FB0BE'
+          Accent: '#4FA3C4'
+          AccentForeground: '#0E1724'
+          Success: '#3FA372'
+          SuccessForeground: '#0E1724'
+          Warning: '#E8A13D'
+          WarningForeground: '#0E1724'
+          Danger: '#E06C5A'
+          DangerForeground: '#0E1724'
+          Dimension: '#9FB0BE'
+          DimensionForeground: '#0E1724'
+          Measure: '#4FA3C4'
+          MeasureForeground: '#0E1724'
+        Sheet:
+          Tile:
+            Border:
+              Show: false
+          TileLayout:
+            Gutter:
+              Show: true
+            Margin:
+              Show: true
+      Permissions:
+        - Principal: !Ref QuickSightUserArn
+          Actions:
+            - quicksight:DescribeTheme
+            - quicksight:DescribeThemePermissions
+            - quicksight:ListThemeVersions
+            - quicksight:UpdateTheme
+            - quicksight:UpdateThemePermissions
+            - quicksight:DeleteTheme
+            - quicksight:CreateThemeAlias
+            - quicksight:DescribeThemeAlias
+            - quicksight:ListThemeAliases
+            - quicksight:UpdateThemeAlias
+            - quicksight:DeleteThemeAlias
+
+  # Athena data source. Depends on DataBucketPolicy because Quick validates
+  # S3 access to the query result location when the data source is created.
+  QSDataSource:
+    Type: AWS::QuickSight::DataSource
+    DependsOn:
+      - AthenaWorkGroup
+      - DataBucketPolicy
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSourceId: ddr-athena-source
+      Name: DDR Athena Source
+      Type: ATHENA
+      DataSourceParameters:
+        AthenaParameters:
+          WorkGroup: !Sub '${AWS::StackName}-ddr-wg'
+      Permissions:
+        - Principal: !Ref QuickSightUserArn
+          Actions:
+            - quicksight:DescribeDataSource
+            - quicksight:DescribeDataSourcePermissions
+            - quicksight:PassDataSource
+            - quicksight:UpdateDataSource
+            - quicksight:DeleteDataSource
+            - quicksight:UpdateDataSourcePermissions
+
+  # Dataset over the Glue table. ImportMode is SPICE (in-memory, refreshed on
+  # a schedule and after each upload) or DIRECT_QUERY (live Athena queries).
+  # InputColumns must match the Glue table; Glue date maps to DATETIME and
+  # double maps to DECIMAL.
+  QSDataSet:
+    Type: AWS::QuickSight::DataSet
+    DependsOn: GlueTable
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: ddr-reports-dataset
+      Name: DDR Reports
+      ImportMode: !Ref DataSetImportMode
+      PhysicalTableMap:
+        ddrtable:
+          RelationalTable:
+            DataSourceArn: !GetAtt QSDataSource.Arn
+            Catalog: AwsDataCatalog
+            Schema: ddr_reports_db
+            Name: ddr_reports
+            InputColumns:
+              - { Name: well_id, Type: STRING }
+              - { Name: operator, Type: STRING }
+              - { Name: rig_name, Type: STRING }
+              - { Name: report_no, Type: STRING }
+              - { Name: report_date, Type: DATETIME }
+              - { Name: spud_date, Type: DATETIME }
+              - { Name: status, Type: STRING }
+              - { Name: measured_depth_ft, Type: DECIMAL }
+              - { Name: tvd_ft, Type: DECIMAL }
+              - { Name: proposed_td_ft, Type: DECIMAL }
+              - { Name: daily_footage_ft, Type: DECIMAL }
+              - { Name: drilling_hours, Type: DECIMAL }
+              - { Name: avg_rop_ft_hr, Type: DECIMAL }
+              - { Name: days_actual, Type: DECIMAL }
+              - { Name: days_planned, Type: DECIMAL }
+              - { Name: flat_days_actual, Type: DECIMAL }
+              - { Name: npt_hours, Type: DECIMAL }
+              - { Name: mud_density_ppg, Type: DECIMAL }
+              - { Name: last_casing_size_in, Type: DECIMAL }
+              - { Name: last_casing_depth_ft, Type: DECIMAL }
+              - { Name: incidents, Type: DECIMAL }
+              - { Name: daily_cost_usd, Type: DECIMAL }
+              - { Name: afe_usd, Type: DECIMAL }
+              - { Name: summary_24h, Type: STRING }
+              - { Name: planned_24h, Type: STRING }
+              - { Name: events, Type: STRING }
+      Permissions:
+        - Principal: !Ref QuickSightUserArn
+          Actions:
+            - quicksight:DescribeDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:PassDataSet
+            - quicksight:DescribeIngestion
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DeleteDataSet
+            - quicksight:CreateIngestion
+            - quicksight:CancelIngestion
+            - quicksight:UpdateDataSetPermissions
+
+  # Hourly full refresh as a safety net; the Lambda also triggers an ingestion
+  # after each upload. Only created in SPICE mode, since DIRECT_QUERY always
+  # reads current data.
+  QSRefreshSchedule:
+    Type: AWS::QuickSight::RefreshSchedule
+    Condition: UseSpice
+    DependsOn: QSDataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: ddr-reports-dataset
+      Schedule:
+        ScheduleId: ddr-hourly-refresh
+        RefreshType: FULL_REFRESH
+        ScheduleFrequency:
+          Interval: HOURLY
+
+  # Single-sheet dashboard defined inline. A well filter scopes every visual.
+  # The depth_plot calculated field negates measured depth so the time vs depth
+  # line reads downward like a drilling curve. The grid layout is 36 columns
+  # wide; each Elements entry positions one visual by column and row span.
+  QSDashboard:
+    Type: AWS::QuickSight::Dashboard
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DashboardId: ddr-dashboard
+      Name: Daily Drilling Report Intelligence
+      ThemeArn: !GetAtt QSTheme.Arn
+      Permissions:
+        - Principal: !Ref QuickSightUserArn
+          Actions:
+            - quicksight:DescribeDashboard
+            - quicksight:ListDashboardVersions
+            - quicksight:UpdateDashboardPermissions
+            - quicksight:QueryDashboard
+            - quicksight:UpdateDashboard
+            - quicksight:DeleteDashboard
+            - quicksight:DescribeDashboardPermissions
+            - quicksight:UpdateDashboardPublishedVersion
+      Definition:
+        DataSetIdentifierDeclarations:
+          - Identifier: ddr
+            DataSetArn: !GetAtt QSDataSet.Arn
+        CalculatedFields:
+          - DataSetIdentifier: ddr
+            Name: depth_plot
+            Expression: '{measured_depth_ft} * -1'
+        FilterGroups:
+          - FilterGroupId: fg-well
+            CrossDataset: ALL_DATASETS
+            Status: ENABLED
+            Filters:
+              - CategoryFilter:
+                  FilterId: flt-well
+                  Column:
+                    DataSetIdentifier: ddr
+                    ColumnName: well_id
+                  Configuration:
+                    FilterListConfiguration:
+                      MatchOperator: CONTAINS
+                      SelectAllOptions: FILTER_ALL_VALUES
+            ScopeConfiguration:
+              SelectedSheets:
+                SheetVisualScopingConfigurations:
+                  - SheetId: main
+                    Scope: ALL_VISUALS
+        Sheets:
+          - SheetId: main
+            Name: Operations Overview
+            FilterControls:
+              - Dropdown:
+                  FilterControlId: ctl-well
+                  SourceFilterId: flt-well
+                  Title: Well
+                  Type: MULTI_SELECT
+            Visuals:
+              - KPIVisual:
+                  VisualId: kpi-depth
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText: { PlainText: 'Depth vs Proposed TD (ft)' }
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: f-depth
+                            Column: { DataSetIdentifier: ddr, ColumnName: measured_depth_ft }
+                            AggregationFunction: { SimpleNumericalAggregation: MAX }
+                      TargetValues:
+                        - NumericalMeasureField:
+                            FieldId: f-depth-tgt
+                            Column: { DataSetIdentifier: ddr, ColumnName: proposed_td_ft }
+                            AggregationFunction: { SimpleNumericalAggregation: MAX }
+                    KPIOptions:
+                      ProgressBar: { Visibility: VISIBLE }
+                      Comparison:
+                        ComparisonMethod: PERCENT
+              - KPIVisual:
+                  VisualId: kpi-days
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText: { PlainText: 'Days on Well' }
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: f-days
+                            Column: { DataSetIdentifier: ddr, ColumnName: days_actual }
+                            AggregationFunction: { SimpleNumericalAggregation: MAX }
+              - KPIVisual:
+                  VisualId: kpi-rop
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText: { PlainText: 'Avg ROP (ft/hr), Latest Day' }
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: f-rop
+                            Column: { DataSetIdentifier: ddr, ColumnName: avg_rop_ft_hr }
+                            AggregationFunction: { SimpleNumericalAggregation: AVERAGE }
+                      TrendGroups:
+                        - DateDimensionField:
+                            FieldId: f-rop-trend
+                            Column: { DataSetIdentifier: ddr, ColumnName: report_date }
+                            DateGranularity: DAY
+                    KPIOptions:
+                      PrimaryValueDisplayType: ACTUAL
+                      TrendArrows: { Visibility: HIDDEN }
+                      SecondaryValue: { Visibility: HIDDEN }
+                      Sparkline:
+                        Visibility: VISIBLE
+                        Type: AREA
+                        Color: '#4FA3C4'
+              - KPIVisual:
+                  VisualId: kpi-ftg
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText: { PlainText: 'Daily Footage (ft), Latest Day' }
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: f-ftg
+                            Column: { DataSetIdentifier: ddr, ColumnName: daily_footage_ft }
+                            AggregationFunction: { SimpleNumericalAggregation: SUM }
+                      TrendGroups:
+                        - DateDimensionField:
+                            FieldId: f-ftg-trend
+                            Column: { DataSetIdentifier: ddr, ColumnName: report_date }
+                            DateGranularity: DAY
+                    KPIOptions:
+                      PrimaryValueDisplayType: ACTUAL
+                      TrendArrows: { Visibility: HIDDEN }
+                      SecondaryValue: { Visibility: HIDDEN }
+                      Sparkline:
+                        Visibility: VISIBLE
+                        Type: AREA
+                        Color: '#4FA3C4'
+              - KPIVisual:
+                  VisualId: kpi-npt
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText: { PlainText: 'NPT Hours' }
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: f-npt
+                            Column: { DataSetIdentifier: ddr, ColumnName: npt_hours }
+                            AggregationFunction: { SimpleNumericalAggregation: SUM }
+              - KPIVisual:
+                  VisualId: kpi-inc
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText: { PlainText: 'Safety Incidents' }
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: f-inc
+                            Column: { DataSetIdentifier: ddr, ColumnName: incidents }
+                            AggregationFunction: { SimpleNumericalAggregation: SUM }
+              - LineChartVisual:
+                  VisualId: line-depth
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText: { PlainText: 'Time vs Depth (depth increases downward)' }
+                  ChartConfiguration:
+                    FieldWells:
+                      LineChartAggregatedFieldWells:
+                        Category:
+                          - DateDimensionField:
+                              FieldId: f-td-date
+                              Column: { DataSetIdentifier: ddr, ColumnName: report_date }
+                              DateGranularity: DAY
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: f-td-depth
+                              Column: { DataSetIdentifier: ddr, ColumnName: depth_plot }
+                              AggregationFunction: { SimpleNumericalAggregation: MIN }
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort: { FieldId: f-td-date, Direction: ASC }
+              - GaugeChartVisual:
+                  VisualId: gauge-td
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText: { PlainText: 'TD Attainment' }
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: g-depth
+                            Column: { DataSetIdentifier: ddr, ColumnName: measured_depth_ft }
+                            AggregationFunction: { SimpleNumericalAggregation: MAX }
+                      TargetValues:
+                        - NumericalMeasureField:
+                            FieldId: g-target
+                            Column: { DataSetIdentifier: ddr, ColumnName: proposed_td_ft }
+                            AggregationFunction: { SimpleNumericalAggregation: MAX }
+                    GaugeChartOptions:
+                      Comparison:
+                        ComparisonMethod: PERCENT
+              - PieChartVisual:
+                  VisualId: donut-well
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText: { PlainText: 'Footage by Well (ft)' }
+                  ChartConfiguration:
+                    FieldWells:
+                      PieChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField:
+                              FieldId: d-well
+                              Column: { DataSetIdentifier: ddr, ColumnName: well_id }
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: d-ftg
+                              Column: { DataSetIdentifier: ddr, ColumnName: daily_footage_ft }
+                              AggregationFunction: { SimpleNumericalAggregation: SUM }
+                    DonutOptions:
+                      ArcOptions:
+                        ArcThickness: MEDIUM
+                    DataLabels:
+                      Visibility: VISIBLE
+              - ComboChartVisual:
+                  VisualId: combo-ops
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText: { PlainText: 'Daily Footage (bars) and Avg ROP (line)' }
+                  ChartConfiguration:
+                    FieldWells:
+                      ComboChartAggregatedFieldWells:
+                        Category:
+                          - DateDimensionField:
+                              FieldId: c-date
+                              Column: { DataSetIdentifier: ddr, ColumnName: report_date }
+                              DateGranularity: DAY
+                        BarValues:
+                          - NumericalMeasureField:
+                              FieldId: c-ftg
+                              Column: { DataSetIdentifier: ddr, ColumnName: daily_footage_ft }
+                              AggregationFunction: { SimpleNumericalAggregation: SUM }
+                        LineValues:
+                          - NumericalMeasureField:
+                              FieldId: c-rop
+                              Column: { DataSetIdentifier: ddr, ColumnName: avg_rop_ft_hr }
+                              AggregationFunction: { SimpleNumericalAggregation: AVERAGE }
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort: { FieldId: c-date, Direction: ASC }
+              - TableVisual:
+                  VisualId: tbl-summary
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText: { PlainText: 'Daily Summaries and Extracted Events' }
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - DateDimensionField:
+                              FieldId: t-date
+                              Column: { DataSetIdentifier: ddr, ColumnName: report_date }
+                              DateGranularity: DAY
+                          - CategoricalDimensionField:
+                              FieldId: t-well
+                              Column: { DataSetIdentifier: ddr, ColumnName: well_id }
+                          - CategoricalDimensionField:
+                              FieldId: t-op
+                              Column: { DataSetIdentifier: ddr, ColumnName: operator }
+                          - CategoricalDimensionField:
+                              FieldId: t-sum
+                              Column: { DataSetIdentifier: ddr, ColumnName: summary_24h }
+                          - CategoricalDimensionField:
+                              FieldId: t-evt
+                              Column: { DataSetIdentifier: ddr, ColumnName: events }
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort: { FieldId: t-date, Direction: DESC }
+            Layouts:
+              - Configuration:
+                  GridLayout:
+                    CanvasSizeOptions:
+                      ScreenCanvasSizeOptions:
+                        ResizeOption: FIXED
+                        OptimizedViewPortWidth: 1600px
+                    Elements:
+                      - { ElementId: ctl-well, ElementType: FILTER_CONTROL, ColumnIndex: 0, ColumnSpan: 6, RowIndex: 0, RowSpan: 6 }
+                      - { ElementId: kpi-depth, ElementType: VISUAL, ColumnIndex: 6, ColumnSpan: 5, RowIndex: 0, RowSpan: 6 }
+                      - { ElementId: kpi-days, ElementType: VISUAL, ColumnIndex: 11, ColumnSpan: 5, RowIndex: 0, RowSpan: 6 }
+                      - { ElementId: kpi-rop, ElementType: VISUAL, ColumnIndex: 16, ColumnSpan: 5, RowIndex: 0, RowSpan: 6 }
+                      - { ElementId: kpi-ftg, ElementType: VISUAL, ColumnIndex: 21, ColumnSpan: 5, RowIndex: 0, RowSpan: 6 }
+                      - { ElementId: kpi-npt, ElementType: VISUAL, ColumnIndex: 26, ColumnSpan: 5, RowIndex: 0, RowSpan: 6 }
+                      - { ElementId: kpi-inc, ElementType: VISUAL, ColumnIndex: 31, ColumnSpan: 5, RowIndex: 0, RowSpan: 6 }
+                      - { ElementId: line-depth, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 22, RowIndex: 6, RowSpan: 12 }
+                      - { ElementId: gauge-td, ElementType: VISUAL, ColumnIndex: 22, ColumnSpan: 14, RowIndex: 6, RowSpan: 6 }
+                      - { ElementId: donut-well, ElementType: VISUAL, ColumnIndex: 22, ColumnSpan: 14, RowIndex: 12, RowSpan: 6 }
+                      - { ElementId: combo-ops, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 18, RowSpan: 9 }
+                      - { ElementId: tbl-summary, ElementType: VISUAL, ColumnIndex: 0, ColumnSpan: 36, RowIndex: 27, RowSpan: 10 }
+
+Outputs:
+  BucketName:
+    Description: Upload DDR PDFs under the raw/ prefix of this bucket
+    Value: !Ref DataBucket
+  UploadExample:
+    Description: Example upload command
+    Value: !Sub 'aws s3 cp report.pdf s3://${BucketPrefix}-${AWS::AccountId}/raw/'
+  DashboardUrl:
+    Description: QuickSight dashboard URL
+    Value: !Sub 'https://${AWS::Region}.quicksight.aws.amazon.com/sn/dashboards/ddr-dashboard'
